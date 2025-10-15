@@ -1,9 +1,9 @@
 name: Sonar minimal
 
 on:
+  workflow_dispatch:
   push:
     branches: [ main ]
-  workflow_dispatch:
 
 env:
   PROJECT_KEY: Django
@@ -13,22 +13,33 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      # Quick sanity: is the server reachable?
-      - name: Sonar status
+      - name: Quick GET check
         env:
-          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}   # e.g. https://sonarqube-rps908qj.lab.practical-devsecops.training
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
           SONAR_TOKEN:    ${{ secrets.SONAR_TOKEN }}
         run: |
-          set -e
           BASE="${SONAR_HOST_URL%/}"
           echo "GET $BASE/api/system/status"
           curl -sf -u "$SONAR_TOKEN:" "$BASE/api/system/status" && echo
 
-      # Single scan step, nothing else
-      - name: Sonar scan
+      - name: Minimal POST reachability (should return 400 fast)
+        env:
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+          SONAR_TOKEN:    ${{ secrets.SONAR_TOKEN }}
+        run: |
+          set -x
+          BASE="${SONAR_HOST_URL%/}"
+          echo x > dummy.zip
+          # If POST path is reachable, SonarQube replies quickly with 400 Bad Request (invalid report).
+          # If it TIMES OUT, something on the path is blocking/buffering multipart POSTs.
+          curl --http1.1 -u "${SONAR_TOKEN}:" \
+               -F "projectKey=${{ env.PROJECT_KEY }}" \
+               -F "report=@dummy.zip" \
+               -sS -o /dev/stderr -w "HTTP:%{http_code}\n" \
+               "${BASE}/api/ce/submit"
+
+      - name: Sonar scan (vanilla)
         uses: sonarsource/sonarqube-scan-action@master
         env:
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
