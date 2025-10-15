@@ -1,25 +1,29 @@
-name: Django                                  # workflow name
+name: Django CI
 
 on:
   push:
-    branches:                                 # similar to "only" in GitLab
+    branches:
       - main
+  workflow_dispatch:
+
+env:
+  # Do NOT put secrets here; only non-secret defaults
+  PROJECT_KEY: Django
 
 jobs:
   build:
-    runs-on: ubuntu-22.04                    # similar to "image" in GitLab
+    runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
 
-      - name: Setup python
-        uses: actions/setup-python@v2
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.7'
+          python-version: '3.11'
 
-      - run: |
-          pip3 install --upgrade virtualenv
-          virtualenv env
-          source env/bin/activate
+      - name: Install deps & sanity check app
+        run: |
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
           python manage.py check
 
@@ -27,41 +31,145 @@ jobs:
     runs-on: ubuntu-22.04
     needs: build
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
 
-      - name: Setup python
-        uses: actions/setup-python@v2
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.7'
+          python-version: '3.11'
 
-      - run: |
-          pip3 install --upgrade virtualenv
-          virtualenv env
-          source env/bin/activate
-          pip install -r requirements.txt
-          python manage.py test taskManager
-  
+      - name: Run unit tests with coverage (XML)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest pytest-cov
+          pytest --cov=. --cov-report=xml
+
+      - name: Upload coverage.xml (artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          if-no-files-found: warn
+
   sonarqube:
     runs-on: ubuntu-22.04
+    needs: test
     steps:
-    - uses: actions/checkout@v2
-      with:
-        fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-    - name: SonarQube Scan
-      uses: sonarsource/sonarqube-scan-action@master
-      continue-on-error: true
-      env:
-        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-        SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
-      with:
-        projectBaseDir: .
-        args: >
-          -Dsonar.projectKey=Django
-  
+      - name: Install diagnostics tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl jq dnsutils iputils-ping traceroute netcat-openbsd openssl ca-certificates
+
+      - name: Show runner & network basics
+        run: |
+          echo "Date: $(date -u)"
+          echo "Kernel: $(uname -a)"
+          echo "OpenSSL: $(openssl version)"
+          echo "cURL: $(curl --version | head -n1)"
+          echo "Resolved SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}"
+          echo "DNS A/AAAA for host:"
+          host "$(echo "${{ secrets.SONAR_HOST_URL }}" | sed -E 's#https?://([^/]+)/?.*#\1#')" || true
+          echo "Traceroute (first 15 hops):"
+          traceroute -m 15 "$(echo "${{ secrets.SONAR_HOST_URL }}" | sed -E 's#https?://([^/]+)/?.*#\1#')" || true
+
+      - name: Preflight: API status (unauth + auth)
+        env:
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          set -x
+          # Strip trailing slash
+          BASE="${SONAR_HOST_URL%/}"
+          # Plain status (should be 200, no auth required)
+          echo "== GET $BASE/api/system/status (no auth) =="
+          curl -sv --max-time 20 "$BASE/api/system/status" -o preflight_status_noauth.json || true
+          echo; echo "Response (noauth):"; cat preflight_status_noauth.json || true
+
+          # Auth status check (some setups require auth for some APIs)
+          echo "== GET $BASE/api/system/status (basic auth token) =="
+          curl -sv --max-time 20 -u "$SONAR_TOKEN:" "$BASE/api/system/status" -o preflight_status_auth.json || true
+          echo; echo "Response (auth):"; cat preflight_status_auth.json || true
+
+          # Validate token
+          echo "== GET $BASE/api/authentication/validate =="
+          curl -sv --max-time 20 -u "$SONAR_TOKEN:" "$BASE/api/authentication/validate" -o preflight_validate.json || true
+          echo; echo "Response (validate):"; cat preflight_validate.json || true
+
+          # Check project exists
+          echo "== GET $BASE/api/projects/search?projects=${{ env.PROJECT_KEY }} =="
+          curl -sv --max-time 20 -u "$SONAR_TOKEN:" \
+            "$BASE/api/projects/search?projects=${{ env.PROJECT_KEY }}" \
+            -o preflight_project.json || true
+          echo; echo "Response (project):"; cat preflight_project.json || true
+
+      - name: TLS probe (openssl s_client)
+        env:
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        run: |
+          HOST="$(echo "${SONAR_HOST_URL}" | sed -E 's#https?://([^/]+)/?.*#\1#')"
+          echo "== OpenSSL s_client to $HOST:443 =="
+          echo | openssl s_client -connect "$HOST:443" -servername "$HOST" 2>/dev/null | awk 'NR<=40 {print}' || true
+
+      - name: Optional: ping SonarQube host (may be blocked)
+        env:
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        run: |
+          HOST="$(echo "${SONAR_HOST_URL}" | sed -E 's#https?://([^/]+)/?.*#\1#')"
+          ping -c 2 "$HOST" || true
+
+      - name: Download coverage artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-xml
+          path: .
+      
+      - name: SonarQube Scan (verbose + long timeouts)
+        id: scan
+        uses: sonarsource/sonarqube-scan-action@master
+        env:
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}  # e.g., https://sonarqube-... (no trailing slash)
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          projectBaseDir: .
+          args: >
+            -Dsonar.projectKey=${{ env.PROJECT_KEY }}
+            -Dsonar.host.url=${{ secrets.SONAR_HOST_URL }}
+            -Dsonar.login=${{ secrets.SONAR_TOKEN }}
+            -Dsonar.python.version=3.11
+            -Dsonar.python.coverage.reportPaths=coverage.xml
+            -Dsonar.sourceEncoding=UTF-8
+            -Dsonar.log.level=DEBUG
+            -Dsonar.verbose=true
+            -Dsonar.scanner.http.connectTimeout=60000
+            -Dsonar.scanner.http.socketTimeout=600000
+
+      - name: Collect scanner artifacts
+        if: always()
+        run: |
+          mkdir -p sonar_artifacts
+          # Sonar scanner writes a report-task.txt with CE task URL if upload succeeded
+          find . -type f -name "report-task.txt" -maxdepth 3 -print -exec cp {} sonar_artifacts/ \; || true
+          # Copy scannerwork for offline review
+          if [ -d ".scannerwork" ]; then
+            tar -czf sonar_artifacts/scannerwork.tgz .scannerwork || true
+          fi
+          # Save preflight outputs
+          cp -f preflight_*.json sonar_artifacts/ 2>/dev/null || true
+
+      - name: Upload diagnostics (artifact)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sonarqube-diagnostics
+          path: sonar_artifacts
+
   integration:
     runs-on: ubuntu-22.04
-    needs: test
+    needs: sonarqube
     steps:
       - run: echo "This is an integration step"
       - run: exit 1
