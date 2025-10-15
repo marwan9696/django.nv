@@ -120,11 +120,13 @@ jobs:
           name: coverage-xml
           path: .
 
+      # ---------- Primary scan (may fail on upload; we continue to allow fallback) ----------
       - name: SonarQube Scan (verbose + long timeouts)
         id: scan
         uses: sonarsource/sonarqube-scan-action@master
+        continue-on-error: true
         env:
-          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}   # e.g., https://sonarqube-rps908qj.lab.practical-devsecops.training
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         with:
           projectBaseDir: .
@@ -140,6 +142,37 @@ jobs:
             -Dsonar.scanner.http.connectTimeout=60000
             -Dsonar.scanner.http.socketTimeout=600000
 
+      # ---------- Fallback: manual upload of scanner report via curl (HTTP/1.1) ----------
+      - name: Manual upload fallback (curl -> /api/ce/submit)
+        if: always()
+        env:
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          PROJECT_KEY: ${{ env.PROJECT_KEY }}
+        run: |
+          set -e
+          BASE="${SONAR_HOST_URL%/}"
+          ZIP_PATH="$(find . -path '*/.scannerwork/scanner-report.zip' | head -n1 || true)"
+          if [ -z "$ZIP_PATH" ]; then
+            echo "No scanner-report.zip found; nothing to manually upload."
+            exit 0
+          fi
+          echo "Found report: $ZIP_PATH"
+          echo "Uploading with curl (forcing HTTP/1.1; long timeout)..."
+          HTTP_CODE=$(curl --write-out "%{http_code}" --output curl_submit_out.txt \
+            --http1.1 --max-time 600 -u "${SONAR_TOKEN}:" \
+            -F "projectKey=${PROJECT_KEY}" \
+            -F "report=@${ZIP_PATH}" \
+            "${BASE}/api/ce/submit")
+          echo "HTTP code: $HTTP_CODE"
+          echo "Server response body:"
+          cat curl_submit_out.txt || true
+          # Non-2xx? Make it visible but don't hard-fail the workflow
+          case "$HTTP_CODE" in
+            2*) echo "Manual upload succeeded." ;;
+            *)  echo "Manual upload failed with HTTP $HTTP_CODE" ; exit 1 ;;
+          esac
+
       - name: Collect scanner artifacts
         if: always()
         run: |
@@ -149,6 +182,7 @@ jobs:
             tar -czf sonar_artifacts/scannerwork.tgz .scannerwork || true
           fi
           cp -f preflight_*.json sonar_artifacts/ 2>/dev/null || true
+          [ -f curl_submit_out.txt ] && cp curl_submit_out.txt sonar_artifacts/
 
       - name: Upload diagnostics (artifact)
         if: always()
